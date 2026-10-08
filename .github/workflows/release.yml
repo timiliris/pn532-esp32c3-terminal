@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install platformio
+      - run: pio test -e native
+      - run: pio run -e c3 -e c3-sh1106
+      - name: Collect binaries
+        run: |
+          mkdir dist
+          for env in c3 c3-sh1106; do
+            b=.pio/build/$env
+            # OTA image (Settings > Firmware update, or POST /api/v1/update)
+            cp $b/firmware.bin dist/firmware-$env.bin
+            # Full image for a blank board, flashed at offset 0x0
+            python ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32c3 merge_bin \
+              -o dist/factory-$env.bin --flash_mode dio --flash_size 4MB \
+              0x0 $b/bootloader.bin 0x8000 $b/partitions.bin \
+              0xe000 ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin \
+              0x10000 $b/firmware.bin
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

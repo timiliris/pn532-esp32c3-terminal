@@ -1,0 +1,321 @@
+openapi: 3.0.3
+info:
+  title: PN532 ESP32-C3 Terminal
+  version: 1.0.0
+  license: { name: MIT }
+  description: |
+    Local API of a passive NFC terminal (ESP32-C3 + PN532 + OLED).
+
+    **Model.** The terminal is passive: an app creates a *job*, the terminal shows
+    "Place the badge", and the job runs on the first badge presented (20 s max).
+    One job at a time (`409 busy` otherwise).
+
+    **Discovery.** mDNS service `_rfid-terminal._tcp` (TXT: `name`, `fw`, `api`), or
+    `http://<hostname>.local` (default `rfid.local`).
+
+    **Auth.** Pair once: `POST /pair/start` shows a 6-digit code on the terminal display,
+    `POST /pair/confirm` exchanges it for a token. Then send `Authorization: Bearer <token>`
+    on every route except `/info` and `/pair/*`. Request bodies are JSON
+    (`Content-Type: application/json`).
+
+    **Live events.** WebSocket `GET /api/v1/events?token=<token>`. Each message is
+    `{"event": "...", "data": {...}, "t": <epoch or 0>}`:
+      - `hello`         : `{info, card?, job?}` on connect
+      - `card.present`  : Card
+      - `card.removed`  : `{uid}`
+      - `job.updated`   : Job (without `result`; fetch `GET /jobs/{id}`)
+      - `reader.status` : `{ok, firmware}`
+
+    **Errors.** `{"error": {"code": "...", "message": "..."}}` (messages in English).
+    Job messages (`Job.message`) use the display language; use `Job.code` in code.
+servers:
+  - url: http://rfid.local/api/v1
+security:
+  - bearer: []
+
+paths:
+  /info:
+    get:
+      summary: Identity and status (network details only when authenticated)
+      security: []
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Info" } } } }
+
+  /pair/start:
+    post:
+      summary: Show a pairing code on the display (valid 120 s)
+      security: []
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { expires_in_s: { type: integer } } } } } }
+  /pair/confirm:
+    post:
+      summary: Exchange the code for a token (5 attempts max)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, example: "042917" }
+                name: { type: string, maxLength: 32, example: "Inventory app" }
+      responses:
+        "201":
+          description: Paired. The token is only returned once; store it.
+          content: { application/json: { schema: { type: object, properties: { token: { type: string }, id: { type: string }, name: { type: string } } } } }
+        "403": { $ref: "#/components/responses/Error" }
+        "410": { $ref: "#/components/responses/Error" }
+
+  /tokens:
+    get:
+      summary: Paired devices
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object, properties: { id: { type: string }, name: { type: string }, created: { type: integer } } } } } } }
+  /tokens/{id}:
+    delete:
+      summary: Revoke a paired device
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses:
+        "204": { description: Revoked }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /card:
+    get:
+      summary: Badge currently on the reader
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Card" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /read:
+    post:
+      summary: Read the next badge (full dump + decoded NDEF)
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/KeyOnly" } } }
+      responses: { "202": { $ref: "#/components/responses/Job" }, "409": { $ref: "#/components/responses/Error" }, "503": { $ref: "#/components/responses/Error" } }
+  /write/ndef:
+    post:
+      summary: Write an NDEF message (NTAG / Ultralight)
+      description: Factory Lock/Memory Control TLVs in front of the message are kept.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [records]
+              properties:
+                records:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [type, value]
+                    properties:
+                      type: { type: string, enum: [url, text] }
+                      value: { type: string, example: "https://example.com" }
+                      lang: { type: string, description: "text only; defaults to the display language" }
+      responses: { "202": { $ref: "#/components/responses/Job" }, "400": { $ref: "#/components/responses/Error" }, "409": { $ref: "#/components/responses/Error" } }
+  /write/raw:
+    post:
+      summary: Write one block (Classic, 16 bytes) or page (NTAG, 4 bytes), zero padded
+      description: Block 0, sector trailers and pages 0-3 / configuration pages are refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [block]
+              properties:
+                block: { type: integer, example: 4 }
+                hex: { type: string, example: "48656C6C6F" }
+                text: { type: string, maxLength: 16 }
+                key: { $ref: "#/components/schemas/Key" }
+      responses: { "202": { $ref: "#/components/responses/Job" }, "400": { $ref: "#/components/responses/Error" } }
+  /erase:
+    post:
+      summary: Clear the user area of the next badge (NTAG back to factory state)
+      requestBody:
+        content: { application/json: { schema: { $ref: "#/components/schemas/KeyOnly" } } }
+      responses: { "202": { $ref: "#/components/responses/Job" } }
+
+  /jobs:
+    get:
+      summary: Recent jobs, newest first
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Job" } } } } }
+  /jobs/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: integer } }]
+    get:
+      summary: One job, with its result
+      responses: { "200": { $ref: "#/components/responses/Job" }, "404": { $ref: "#/components/responses/Error" } }
+    delete:
+      summary: Cancel a job that is still waiting for a badge
+      responses: { "200": { $ref: "#/components/responses/Job" }, "409": { $ref: "#/components/responses/Error" } }
+
+  /history:
+    get:
+      summary: Last 20 badges seen
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    uid: { type: string }
+                    type: { type: string }
+                    seconds_ago: { type: integer }
+                    at: { type: integer, description: "epoch; absent until the clock is synchronized" }
+
+  /display:
+    post:
+      summary: Show a message on the display
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text: { type: string, maxLength: 120 }
+                seconds: { type: integer, default: 10, minimum: 0, maximum: 3600 }
+      responses: { "204": { description: Shown } }
+
+  /config:
+    get:
+      summary: Settings
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Config" } } } } }
+    put:
+      summary: Change settings (partial updates accepted; hostname applies after a reboot)
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/Config" } } } }
+      responses: { "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Config" } } } }, "400": { $ref: "#/components/responses/Error" } }
+
+  /wifi:
+    put:
+      summary: Save a Wi-Fi network and reboot
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [ssid], properties: { ssid: { type: string }, password: { type: string } } } } }
+      responses: { "202": { description: Rebooting } }
+  /wifi/scan:
+    get:
+      summary: Visible networks (202 while scanning, call again)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { networks: { type: array, items: { type: object, properties: { ssid: { type: string }, rssi: { type: integer }, open: { type: boolean } } } } } } } } }
+        "202": { description: Scanning }
+
+  /update:
+    post:
+      summary: Over-the-air firmware update (firmware-*.bin from a release), then reboot
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { type: object, properties: { firmware: { type: string, format: binary } } }
+      responses: { "200": { description: Updated, rebooting }, "400": { $ref: "#/components/responses/Error" } }
+
+  /reboot:
+    post:
+      summary: Reboot
+      responses: { "202": { description: Rebooting } }
+  /factory-reset:
+    post:
+      summary: Erase Wi-Fi, paired devices and settings, then reboot
+      responses: { "202": { description: Resetting } }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  responses:
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Job:
+      description: Job
+      content: { application/json: { schema: { $ref: "#/components/schemas/Job" } } }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: object, properties: { code: { type: string }, message: { type: string } } }
+    Key: { type: string, pattern: "^[0-9A-Fa-f]{12}$", description: "MIFARE Classic key A, FFFFFFFFFFFF by default" }
+    KeyOnly:
+      type: object
+      properties: { key: { $ref: "#/components/schemas/Key" } }
+    Info:
+      type: object
+      properties:
+        name: { type: string }
+        firmware: { type: string }
+        paired: { type: boolean }
+        reader: { type: object, properties: { ok: { type: boolean }, firmware: { type: string } } }
+        display: { type: object, properties: { ok: { type: boolean } } }
+        network: { type: object, properties: { mode: { type: string, enum: [sta, ap] }, ssid: { type: string }, ip: { type: string }, hostname: { type: string }, rssi: { type: integer } } }
+        uptime_s: { type: integer }
+        heap_free: { type: integer }
+        time: { type: integer }
+    Card:
+      type: object
+      properties:
+        uid: { type: string, example: "04:A2:3B:1C:5D:80:00" }
+        type: { type: string, example: NTAG215 }
+        kind: { type: string, enum: [type2, mifare_classic, unsupported] }
+        sak: { type: integer }
+        atqa: { type: integer }
+        ndef_capacity: { type: integer, description: type2 only }
+        sectors: { type: integer, description: mifare_classic only }
+    Job:
+      type: object
+      properties:
+        id: { type: integer }
+        kind: { type: string, enum: [read, write_ndef, write_raw, erase] }
+        state: { type: string, enum: [waiting, running, done, error, cancelled, timeout] }
+        code:
+          type: string
+          description: Machine-readable outcome
+          enum: [ok, card_removed, unsupported_card, ndef_type2_only, not_ndef_formatted, too_long, write_failed,
+                 bad_data, out_of_range, protected_block, auth_failed, timeout, cancelled]
+        message: { type: string, description: "Human-readable outcome, in the display language" }
+        uid: { type: string, description: "badge the job ran on" }
+        expires_in_ms: { type: integer, description: "state=waiting only" }
+        result:
+          description: "finished read jobs only"
+          oneOf:
+            - type: object
+              properties:
+                kind: { type: string, enum: [type2] }
+                pages: { type: array, items: { type: string, example: "E1101200" } }
+                ndef:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string, enum: [url, text, other] }
+                      value: { type: string }
+                      lang: { type: string }
+                      tnf: { type: integer }
+                      record_type: { type: string }
+            - type: object
+              properties:
+                kind: { type: string, enum: [mifare_classic] }
+                sectors:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      sector: { type: integer }
+                      locked: { type: boolean }
+                      blocks: { type: array, items: { type: string, nullable: true } }
+    Config:
+      type: object
+      properties:
+        name: { type: string, maxLength: 24 }
+        hostname: { type: string, pattern: "^[a-z0-9-]{1,24}$" }
+        lang: { type: string, enum: [en, fr] }
+        contrast: { type: integer, minimum: 0, maximum: 255 }
