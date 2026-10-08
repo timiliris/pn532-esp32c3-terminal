@@ -91,7 +91,9 @@ Factory reset: hold the BOOT button for 5 seconds (or `POST /api/v1/factory-rese
 
 ## API
 
-Full specification: [`docs/openapi.yaml`](docs/openapi.yaml).
+Integration guide: [`docs/API-Integration-Guide.md`](docs/API-Integration-Guide.md) (pairing, jobs, events,
+result codes, JS / Python examples). Full specification: [`docs/openapi.yaml`](docs/openapi.yaml).
+More in the [wiki](https://github.com/timiliris/pn532-esp32c3-terminal/wiki).
 
 ```bash
 # pair (the code shows on the display)
